@@ -4,45 +4,32 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: macOS + Tailscale + RustDesk
+  mac:
+    name: macOS Tailscale RustDesk
     runs-on: macos-latest
 
     steps:
 
-      # ==========================================
-      # 1. Connect Tailscale
-      # ==========================================
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
 
-      # ==========================================
-      # 2. Check Tailscale
-      # ==========================================
       - name: Check Tailscale
         shell: bash
         run: |
           set -e
 
-          echo "======================================"
-          echo "TAILSCALE STATUS"
-          echo "======================================"
+          echo "================================"
+          echo "TAILSCALE"
+          echo "================================"
 
           tailscale status
 
           echo ""
-          echo "Tailscale IPv4:"
+          echo "VPN IP:"
           tailscale ip -4
 
-          echo ""
-          echo "Hostname:"
-          hostname
-
-      # ==========================================
-      # 3. Install RustDesk
-      # ==========================================
       - name: Install RustDesk
         shell: bash
         run: |
@@ -50,195 +37,169 @@ jobs:
 
           echo "Downloading RustDesk..."
 
-          DMG_URL="$(
-            python3 - <<'PY'
-import json
-import urllib.request
+          URL=$(python3 -c '
+          import json
+          import urllib.request
 
-url = "https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
+          u="https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
 
-with urllib.request.urlopen(url) as r:
-    data = json.load(r)
+          with urllib.request.urlopen(u) as r:
+              d=json.load(r)
 
-for asset in data["assets"]:
-    name = asset["name"].lower()
+          for a in d["assets"]:
+              n=a["name"].lower()
+              if n.endswith(".dmg") and ("aarch64" in n or "x86_64" in n or "arm64" in n):
+                  print(a["browser_download_url"])
+                  break
+          ')
 
-    if name.endswith(".dmg") and (
-        "aarch64" in name
-        or "arm64" in name
-        or "x86_64" in name
-    ):
-        print(asset["browser_download_url"])
-        break
-else:
-    raise SystemExit("RustDesk DMG not found")
-PY
-          )"
+          echo "Download URL:"
+          echo "$URL"
 
-          echo "DMG: $DMG_URL"
-
-          curl -L \
-            --fail \
-            --retry 3 \
-            "$DMG_URL" \
+          curl -L --fail --retry 3 \
+            "$URL" \
             -o "$RUNNER_TEMP/rustdesk.dmg"
 
-          mkdir -p "$RUNNER_TEMP/rustdesk_mount"
+          mkdir -p "$RUNNER_TEMP/rustdesk"
 
           hdiutil attach \
             "$RUNNER_TEMP/rustdesk.dmg" \
-            -mountpoint "$RUNNER_TEMP/rustdesk_mount" \
+            -mountpoint "$RUNNER_TEMP/rustdesk" \
             -nobrowse \
             -readonly
 
           rm -rf "/Applications/RustDesk.app"
 
           cp -R \
-            "$RUNNER_TEMP/rustdesk_mount/RustDesk.app" \
+            "$RUNNER_TEMP/rustdesk/RustDesk.app" \
             "/Applications/RustDesk.app"
 
           hdiutil detach \
-            "$RUNNER_TEMP/rustdesk_mount"
+            "$RUNNER_TEMP/rustdesk"
 
           echo "RustDesk installed."
 
-      # ==========================================
-      # 4. Configure RustDesk
-      # ==========================================
-      - name: Configure RustDesk
+      - name: Start RustDesk
         shell: bash
         run: |
           set -e
 
-          RUSTDESK="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
+          APP="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
 
-          if [ ! -x "$RUSTDESK" ]; then
+          if [ ! -f "$APP" ]; then
             echo "RustDesk executable not found."
             exit 1
           fi
 
-          # Temporary random password
-          RUSTDESK_PASS="$(
-            openssl rand -hex 8
-          )"
-
-          echo "RUSTDESK_PASS=$RUSTDESK_PASS" >> "$GITHUB_ENV"
-
           echo "Starting RustDesk..."
 
-          "$RUSTDESK" --server >/tmp/rustdesk.log 2>&1 &
+          nohup "$APP" \
+            > "$RUNNER_TEMP/rustdesk.log" 2>&1 &
 
           sleep 10
 
+          echo "RustDesk process:"
+          pgrep -fl RustDesk || true
+
+      - name: Get RustDesk ID
+        shell: bash
+        run: |
+          set -e
+
+          APP="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
+
           echo "Getting RustDesk ID..."
 
-          RUSTDESK_ID="$(
-            "$RUSTDESK" --get-id 2>/dev/null \
-            | tr -d '\r' \
-            | tail -n 1
-          )"
+          ID=$("$APP" --get-id 2>/dev/null | tr -d '\r' | tail -n 1)
 
-          if [ -z "$RUSTDESK_ID" ]; then
+          if [ -z "$ID" ]; then
             echo ""
-            echo "ERROR: RustDesk ID is empty."
+            echo "ERROR: RustDesk ID was not returned."
             echo ""
-            cat /tmp/rustdesk.log || true
+            echo "RustDesk log:"
+            cat "$RUNNER_TEMP/rustdesk.log" || true
             exit 1
           fi
 
-          echo "RUSTDESK_ID=$RUSTDESK_ID" >> "$GITHUB_ENV"
+          echo "RUSTDESK_ID=$ID" >> "$GITHUB_ENV"
 
-          echo "Setting temporary password..."
+          echo "RustDesk ID detected."
 
-          "$RUSTDESK" --password "$RUSTDESK_PASS"
+      - name: Create Temporary Password
+        shell: bash
+        run: |
+          set -e
 
-          echo ""
-          echo "RustDesk configured."
+          APP="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
 
-      # ==========================================
-      # 5. Verify RustDesk
-      # ==========================================
+          PASS=$(openssl rand -hex 8)
+
+          "$APP" --password "$PASS"
+
+          echo "RUSTDESK_PASS=$PASS" >> "$GITHUB_ENV"
+
+          echo "Temporary password created."
+
       - name: Verify RustDesk
         shell: bash
         run: |
-          echo "======================================"
-          echo "RUSTDESK CHECK"
-          echo "======================================"
+          set -e
+
+          echo "================================"
+          echo "RUSTDESK STATUS"
+          echo "================================"
+
+          pgrep -fl RustDesk || true
 
           echo ""
           echo "RustDesk ID:"
           echo "$RUSTDESK_ID"
 
-          echo ""
-          echo "RustDesk process:"
-          pgrep -fl RustDesk || true
-
-          echo ""
-          echo "RustDesk log:"
-          cat /tmp/rustdesk.log || true
-
           if [ -z "$RUSTDESK_ID" ]; then
-            echo ""
-            echo "RustDesk ID verification FAILED."
+            echo "RustDesk verification failed."
             exit 1
           fi
 
           echo ""
           echo "RustDesk ID verification OK."
 
-      # ==========================================
-      # 6. Connection Information
-      # ==========================================
       - name: Connection Information
         shell: bash
         run: |
-          VPN_IP="$(tailscale ip -4)"
-          HOST="$(hostname)"
+          set -e
+
+          VPN_IP=$(tailscale ip -4)
+          HOST=$(hostname)
 
           echo ""
-          echo "=============================================="
-          echo "           CONNECTION INFORMATION"
-          echo "=============================================="
+          echo "=========================================="
+          echo "       CONNECTION INFORMATION"
+          echo "=========================================="
 
           echo ""
           echo "Tailscale VPN"
-          echo "----------------------------------------------"
-          echo "VPN Type : Tailscale"
+          echo "------------------------------------------"
           echo "VPN IP   : $VPN_IP"
           echo "Hostname : $HOST"
 
           echo ""
           echo "RustDesk"
-          echo "----------------------------------------------"
-          echo "RustDesk ID       : $RUSTDESK_ID"
-          echo "RustDesk Password : $RUSTDESK_PASS"
+          echo "------------------------------------------"
+          echo "Remote ID : $RUSTDESK_ID"
+          echo "Password  : $RUSTDESK_PASS"
 
           echo ""
-          echo "=============================================="
-          echo "              STATUS: READY"
-          echo "=============================================="
+          echo "=========================================="
+          echo "STATUS: READY"
+          echo "=========================================="
 
-          echo ""
-          echo "เปิด RustDesk บน iPad"
-          echo "ใส่ Remote ID:"
-          echo "$RUSTDESK_ID"
-
-          echo ""
-          echo "Password:"
-          echo "$RUSTDESK_PASS"
-
-          echo ""
-          echo "=============================================="
-
-      # ==========================================
-      # 7. Keep Runner Alive
-      # ==========================================
-      - name: macOS System Running
+      - name: Keep Runner Alive
         shell: bash
         run: |
-          echo "macOS + Tailscale + RustDesk is running."
+          echo "macOS runner is running."
 
-          while true; do
-            echo "$(date): system alive"
+          while true
+          do
+            echo "$(date): alive"
             sleep 60
           done
