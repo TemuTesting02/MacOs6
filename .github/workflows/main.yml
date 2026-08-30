@@ -3,138 +3,225 @@ name: Mac Remote - Tailscale + RustDesk
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   remote:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 350
 
     steps:
-      - name: Set up job
+      - name: Verify passwordless admin
         shell: bash
         run: |
           set -euo pipefail
-          echo "macOS: $(sw_vers -productVersion)"
-          echo "Runner user: $(whoami)"
+
+          if ! sudo -n true 2>/dev/null; then
+            echo "ERROR: Passwordless sudo is not available."
+            echo "No interactive password prompt will be opened."
+            exit 1
+          fi
+
+          echo "Passwordless sudo is available."
+          sudo -n id
 
       - name: Connect Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          tags: tag:ci
 
-      - name: Verify Tailscale
+      - name: Verify Tailscale and get VPN IP
         shell: bash
         run: |
           set -euo pipefail
 
-          TS_IP=""
           for i in {1..20}; do
             TS_IP="$(tailscale ip -4 2>/dev/null || true)"
+
             if [[ "$TS_IP" =~ ^100\. ]]; then
-              break
+              echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+              echo "Tailscale VPN IP: $TS_IP"
+              tailscale status
+              exit 0
             fi
+
             sleep 2
           done
 
-          if ! [[ "$TS_IP" =~ ^100\. ]]; then
-            echo "ERROR: Tailscale IPv4 not found."
-            tailscale status || true
-            exit 1
-          fi
+          echo "ERROR: Tailscale IPv4 was not detected."
+          tailscale status || true
+          exit 1
 
-          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
-          echo "Tailscale VPN IP: $TS_IP"
-          tailscale status
-
-      - name: Install RustDesk
+      - name: Download RustDesk DMG
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ ! -d "/Applications/RustDesk.app" ]]; then
-            brew install --cask rustdesk
+          python3 > "$RUNNER_TEMP/rustdesk_url" <<'PY'
+          import json
+          import urllib.request
+
+          req = urllib.request.Request(
+              "https://api.github.com/repos/rustdesk/rustdesk/releases/latest",
+              headers={"User-Agent": "GitHub-Actions"}
+          )
+
+          with urllib.request.urlopen(req, timeout=30) as r:
+              release = json.load(r)
+
+          preferred = []
+          fallback = []
+
+          for asset in release.get("assets", []):
+              name = asset["name"]
+              low = name.lower()
+
+              if not low.endswith(".dmg"):
+                  continue
+
+              fallback.append(asset["browser_download_url"])
+
+              if "arm64" in low or "aarch64" in low:
+                  preferred.append(asset["browser_download_url"])
+
+          url = (preferred or fallback or [None])[0]
+
+          if not url:
+              raise SystemExit("No RustDesk DMG found.")
+
+          print(url)
+          PY
+
+          URL="$(cat "$RUNNER_TEMP/rustdesk_url")"
+
+          curl -fL --retry 3 "$URL" \
+            -o "$RUNNER_TEMP/RustDesk.dmg"
+
+          test -s "$RUNNER_TEMP/RustDesk.dmg"
+
+          echo "RustDesk DMG downloaded."
+
+      - name: Install RustDesk without GUI installer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MOUNT="$RUNNER_TEMP/rustdesk_mount"
+          APP="/Applications/RustDesk.app"
+
+          mkdir -p "$MOUNT"
+
+          hdiutil attach \
+            "$RUNNER_TEMP/RustDesk.dmg" \
+            -mountpoint "$MOUNT" \
+            -nobrowse \
+            -readonly \
+            -quiet
+
+          cleanup() {
+            hdiutil detach "$MOUNT" -quiet 2>/dev/null || true
+          }
+
+          trap cleanup EXIT
+
+          SOURCE="$(find "$MOUNT" -maxdepth 2 \
+            -name 'RustDesk.app' \
+            -type d \
+            -print -quit)"
+
+          if [ -z "$SOURCE" ]; then
+            echo "ERROR: RustDesk.app was not found."
+            exit 1
           fi
 
-          test -x "/Applications/RustDesk.app/Contents/MacOS/RustDesk"
+          sudo -n rm -rf "$APP"
+          sudo -n ditto "$SOURCE" "$APP"
+          sudo -n chown -R root:wheel "$APP"
+
+          test -x "$APP/Contents/MacOS/RustDesk"
+
           echo "RustDesk installed."
+          echo "No Installer.app was used."
 
       - name: Install RustDesk service
         shell: bash
         run: |
           set -euo pipefail
 
-          RUSTDESK="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
+          BIN="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
 
-          echo "Installing RustDesk service..."
-          sudo "$RUSTDESK" --install-service
+          sudo -n "$BIN" --install-service
 
           sleep 5
 
           echo "RustDesk service installed."
 
-      - name: Start RustDesk in current user session
+      - name: Set temporary RustDesk password
         shell: bash
         run: |
           set -euo pipefail
 
-          RUSTDESK="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
+          BIN="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
 
-          echo "Starting RustDesk without blocking the workflow..."
-
-          # IMPORTANT:
-          # Do not use plain 'open -a RustDesk' here because the GUI launch
-          # can keep the GitHub Actions step waiting indefinitely.
-          nohup "$RUSTDESK" >/tmp/rustdesk.log 2>&1 </dev/null &
-
-          RUSTDESK_PID=$!
-          echo "RustDesk launcher PID: $RUSTDESK_PID"
-
-          sleep 10
-
-          if pgrep -f "/Applications/RustDesk.app/Contents/MacOS/RustDesk" >/dev/null; then
-            echo "RustDesk process is running."
-          else
-            echo "RustDesk did not stay running."
-            echo "--- RustDesk log ---"
-            cat /tmp/rustdesk.log 2>/dev/null || true
-            exit 1
-          fi
-
-      - name: Create temporary RustDesk password
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          RUSTDESK="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
-          RUSTDESK_PASS="$(openssl rand -hex 8)"
+          PASS="$(openssl rand -hex 8)"
 
           echo "Setting temporary RustDesk password..."
 
-          if ! sudo "$RUSTDESK" --password "$RUSTDESK_PASS"; then
+          OUTPUT="$(
+            sudo -n "$BIN" --password "$PASS" 2>&1
+          )" || {
+            echo "$OUTPUT"
             echo "ERROR: RustDesk rejected the password."
-            echo "--- RustDesk log ---"
-            cat /tmp/rustdesk.log 2>/dev/null || true
+            exit 1
+          }
+
+          echo "$OUTPUT"
+
+          if ! echo "$OUTPUT" | grep -qi "done"; then
+            echo "ERROR: RustDesk did not confirm the password change."
             exit 1
           fi
 
-          echo "RUSTDESK_PASS=$RUSTDESK_PASS" >> "$GITHUB_ENV"
-          echo "Temporary password created."
+          echo "RUSTDESK_PASSWORD=$PASS" >> "$GITHUB_ENV"
+
+          echo "RustDesk password configured."
+
+      - name: Start RustDesk in user session
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="/Applications/RustDesk.app"
+
+          nohup open -a "$APP" \
+            >/tmp/rustdesk-open.log 2>&1 &
+
+          disown || true
+
+          sleep 10
+
+          if ! pgrep -x RustDesk >/dev/null 2>&1; then
+            echo "ERROR: RustDesk GUI did not start."
+            cat /tmp/rustdesk-open.log || true
+            exit 1
+          fi
+
+          echo "RustDesk GUI is running."
 
       - name: Get and verify RustDesk ID
         shell: bash
         run: |
           set -euo pipefail
 
-          RUSTDESK="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
-          RUSTDESK_ID=""
+          BIN="/Applications/RustDesk.app/Contents/MacOS/RustDesk"
+
+          ID=""
 
           for i in {1..20}; do
-            RUSTDESK_ID="$("$RUSTDESK" --get-id 2>/dev/null | tr -cd '0-9' || true)"
+            ID="$(
+              "$BIN" --get-id 2>/dev/null |
+              tr -cd '0-9' || true
+            )"
 
-            if [[ "$RUSTDESK_ID" =~ ^[0-9]{6,}$ ]]; then
+            if [[ "$ID" =~ ^[0-9]{6,}$ ]]; then
               break
             fi
 
@@ -142,44 +229,48 @@ jobs:
             sleep 3
           done
 
-          if ! [[ "$RUSTDESK_ID" =~ ^[0-9]{6,}$ ]]; then
-            echo "ERROR: RustDesk ID not available."
-            echo "--- RustDesk log ---"
-            cat /tmp/rustdesk.log 2>/dev/null || true
+          if ! [[ "$ID" =~ ^[0-9]{6,}$ ]]; then
+            echo "ERROR: RustDesk ID was not detected."
             exit 1
           fi
 
-          echo "RUSTDESK_ID=$RUSTDESK_ID" >> "$GITHUB_ENV"
-          echo "RustDesk ID verified: $RUSTDESK_ID"
+          echo "RUSTDESK_ID=$ID" >> "$GITHUB_ENV"
 
-      - name: Verify RustDesk status
+          echo "RustDesk ID verified: $ID"
+
+      - name: Verify final status
         shell: bash
         run: |
           set -euo pipefail
 
-          if pgrep -f "/Applications/RustDesk.app/Contents/MacOS/RustDesk" >/dev/null; then
-            echo "RUSTDESK_STATUS=RUNNING" >> "$GITHUB_ENV"
-            echo "RustDesk status: RUNNING"
-          else
-            echo "RustDesk status: NOT RUNNING"
+          if ! pgrep -x RustDesk >/dev/null 2>&1; then
+            echo "ERROR: RustDesk is not running."
             exit 1
           fi
+
+          echo "RustDesk: RUNNING"
+          echo "RustDesk ID: $RUSTDESK_ID"
+          echo "Tailscale VPN IP: $TS_IP"
+
+          echo
+          echo "Tailscale status:"
+          tailscale status
 
       - name: Connection Information
         shell: bash
         run: |
-          set -euo pipefail
-
-          echo ""
-          echo "=================================================="
-          echo "              MAC REMOTE CONNECTION"
-          echo "=================================================="
-          echo "RustDesk Status   : $RUSTDESK_STATUS"
+          echo
+          echo "================================================"
+          echo "           CONNECTION INFORMATION"
+          echo "================================================"
+          echo
+          echo "RustDesk Status   : RUNNING"
           echo "RustDesk ID       : $RUSTDESK_ID"
-          echo "RustDesk Password : $RUSTDESK_PASS"
+          echo "RustDesk Password : $RUSTDESK_PASSWORD"
           echo "Tailscale VPN IP  : $TS_IP"
-          echo "=================================================="
-          echo ""
+          echo
+          echo "================================================"
+          echo
 
       - name: Keep Mac running
         shell: bash
@@ -191,16 +282,11 @@ jobs:
 
           trap 'kill "$CAFFEINATE_PID" 2>/dev/null || true' EXIT
 
-          echo "Remote session is ready."
-          echo "The job will stay alive until the workflow timeout."
-
           while true; do
-            if ! pgrep -f "/Applications/RustDesk.app/Contents/MacOS/RustDesk" >/dev/null; then
-              echo "RustDesk stopped."
-              cat /tmp/rustdesk.log 2>/dev/null || true
+            if ! pgrep -x RustDesk >/dev/null 2>&1; then
+              echo "ERROR: RustDesk stopped."
               exit 1
             fi
 
-            echo "[$(date '+%H:%M:%S')] RustDesk=$RUSTDESK_ID Tailscale=$TS_IP"
             sleep 60
           done
